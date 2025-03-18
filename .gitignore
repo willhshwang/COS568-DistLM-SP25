@@ -1,2 +1,6 @@
 /__pycache__
 *.out
+
+glue_data/
+tmp/
+run_adroit.sh
