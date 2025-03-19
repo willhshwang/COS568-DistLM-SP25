@@ -17,6 +17,7 @@
 
 from __future__ import absolute_import, division, print_function
 
+import sys
 import argparse
 import glob
 import logging
@@ -43,6 +44,7 @@ from pytorch_transformers import (WEIGHTS_NAME, BertConfig,
 
 from pytorch_transformers import AdamW, WarmupLinearSchedule
 
+sys.path.append("../") # restructure 
 from utils_glue import (compute_metrics, convert_examples_to_features,
                         output_modes, processors)
 
@@ -139,16 +141,15 @@ def train(args, train_dataset, model, tokenizer):
             tr_loss += loss.item()
             if (step + 1) % args.gradient_accumulation_steps == 0:
                 ##################################################
-                ## Print loss for the first 10 minibatches
-                if t == 0 and step < 10: 
-                    logger.info(f"  Epoch: {t} |  Step: {step} | Loss: {loss.item()}")
-
                 # TODO(cos568): perform a single optimization step (parameter update) by invoking the optimizer (expect one line of code)
                 optimizer.step()
                 ##################################################
                 scheduler.step() # Update learning rate schedule
                 model.zero_grad()
                 global_step += 1
+            
+            with open(args.output_train_file, "a") as writer:
+                writer.write(f"{step},{loss.item()}\n")
 
             if args.max_steps > 0 and global_step > args.max_steps:
                 epoch_iterator.close()
@@ -219,8 +220,7 @@ def evaluate(args, model, tokenizer, prefix=""):
         result = compute_metrics(eval_task, preds, out_label_ids)
         results.update(result)
 
-        output_eval_file = os.path.join(eval_output_dir, "eval_results.txt")
-        with open(output_eval_file, "w") as writer:
+        with open(args.output_eval_file, "a") as writer:
             logger.info("***** Eval results {} *****".format(prefix))
             for key in sorted(result.keys()):
                 logger.info("  %s = %s", key, str(result[key]))
@@ -357,6 +357,18 @@ def main():
     if os.path.exists(args.output_dir) and os.listdir(args.output_dir) and args.do_train and not args.overwrite_output_dir:
         raise ValueError("Output directory ({}) already exists and is not empty. Use --overwrite_output_dir to overcome.".format(args.output_dir))
 
+    # create output files
+    output_eval_file = os.path.join(args.output_dir, "eval_results.txt") # evaluation
+    args.output_eval_file = output_eval_file
+    with open(output_eval_file, "w") as writer:
+        pass
+
+    output_train_file = os.path.join(args.output_dir, "train_results.txt") # training
+    args.output_train_file = output_train_file
+    with open(output_train_file, "w") as writer:
+        writer.write("step,process_loss")
+        pass
+
     # set up (distributed) training
     args.device = torch.device("cuda" if torch.cuda.is_available() and not args.no_cuda else "cpu")
     args.n_gpu = torch.cuda.device_count()
@@ -392,9 +404,7 @@ def main():
     ##################################################
     # TODO(cos568): load the model using from_pretrained. Remember to pass in `config` as an argument.
     # If you pass in args.model_name_or_path (e.g. "bert-base-cased"), the model weights file will be downloaded from HuggingFace. (expect one line of code)
-    
     model = model_class.from_pretrained(args.model_name_or_path, config=config)
-    
     ##################################################
 
     if args.local_rank == 0:

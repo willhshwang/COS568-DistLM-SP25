@@ -17,6 +17,7 @@
 
 from __future__ import absolute_import, division, print_function
 
+import sys
 import argparse
 import glob
 import logging
@@ -28,11 +29,8 @@ import numpy as np
 import torch
 from torch.utils.data import (DataLoader, RandomSampler, SequentialSampler,
                               TensorDataset)
-from torch.nn.parallel import DistributedDataParallel 
 from torch.utils.data.distributed import DistributedSampler
-from torch.distributed.optim import DistributedOptimizer
-import torch.distributed.rpc as rpc
-from torch.distributed.rpc import RRef
+from torch.nn.parallel import DistributedDataParallel 
 from tqdm import tqdm, trange
 
 # import a previous version of the HuggingFace Transformers package
@@ -48,6 +46,7 @@ from pytorch_transformers import (WEIGHTS_NAME, BertConfig,
 
 from pytorch_transformers import AdamW, WarmupLinearSchedule
 
+sys.path.append("../") # restructure 
 from utils_glue import (compute_metrics, convert_examples_to_features,
                         output_modes, processors)
 
@@ -79,7 +78,7 @@ def train(args, train_dataset, model, tokenizer):
     assert(args.total_batch_size == args.per_device_train_batch_size * args.world_size) 
     
     args.train_batch_size = args.per_device_train_batch_size
-    train_sampler = DistributedSampler(train_dataset) # use distributed sampler
+    train_sampler = DistributedSampler(train_dataset) # use distributed sampler instead of RandomSampler
     train_dataloader = DataLoader(train_dataset, sampler=train_sampler, batch_size=args.train_batch_size)
 
     if args.max_steps > 0:
@@ -122,7 +121,7 @@ def train(args, train_dataset, model, tokenizer):
         train_sampler.set_epoch(epoch)
         epoch_iterator = tqdm(train_dataloader, desc="Iteration", disable=args.local_rank not in [-1, 0])
         for step, batch in enumerate(epoch_iterator):
-            start_time = time.time()
+            start_time = time.time() # start timer
             
             model.train()
             batch = tuple(t.to(args.device) for t in batch)
@@ -157,9 +156,11 @@ def train(args, train_dataset, model, tokenizer):
                 model.zero_grad()
                 global_step += 1
             
-            end_time = time.time()
+            end_time = time.time() # end time
             time_elapsed = end_time - start_time
-            logger.info(f" step: {step} | process loss: {loss.item()} | time: {time_elapsed}")
+
+            with open(args.output_train_file, "a") as writer:
+                writer.write(f"{step},{loss.item()},{time_elapsed}\n")
 
             if args.max_steps > 0 and global_step > args.max_steps:
                 epoch_iterator.close()
@@ -231,8 +232,7 @@ def evaluate(args, model, tokenizer, prefix=""):
         result = compute_metrics(eval_task, preds, out_label_ids)
         results.update(result)
 
-        output_eval_file = os.path.join(eval_output_dir, "eval_results.txt")
-        with open(output_eval_file, "w") as writer:
+        with open(args.output_eval_file, "a") as writer:
             logger.info("***** Eval results {} *****".format(prefix))
             for key in sorted(result.keys()):
                 logger.info("  %s = %s", key, str(result[key]))
@@ -379,6 +379,18 @@ def main():
     if os.path.exists(args.output_dir) and os.listdir(args.output_dir) and args.do_train and not args.overwrite_output_dir:
         raise ValueError("Output directory ({}) already exists and is not empty. Use --overwrite_output_dir to overcome.".format(args.output_dir))
 
+    # create output files
+    output_eval_file = os.path.join(args.output_dir, "eval_results.txt") # evaluation
+    args.output_eval_file = output_eval_file
+    with open(output_eval_file, "w") as writer:
+        pass
+
+    output_train_file = os.path.join(args.output_dir, "train_results.txt") # training
+    args.output_train_file = output_train_file
+    with open(output_train_file, "w") as writer:
+        writer.write("step,process_loss,time\n")
+        pass
+
    # Init Process Group 
     torch.distributed.init_process_group(
             backend='gloo', # for cpu
@@ -423,13 +435,14 @@ def main():
     # TODO(cos568): load the model using from_pretrained. Remember to pass in `config` as an argument.
     # If you pass in args.model_name_or_path (e.g. "bert-base-cased"), the model weights file will be downloaded from HuggingFace. (expect one line of code)
     model = model_class.from_pretrained(args.model_name_or_path, config=config)
-    model = DistributedDataParallel(model, devices_ids = [args.local_rank])
     ##################################################
 
     if args.local_rank == 0:
         torch.distributed.barrier()  # Make sure only the first process in distributed training will download model & vocab
-
+    
+    model = DistributedDataParallel(model) # Wrap model around DDP
     model.to(args.device)
+
     logger.info("Training/evaluation parameters %s", args)
 
     # Training
