@@ -22,6 +22,7 @@ import glob
 import logging
 import os
 import random
+import time
 
 import numpy as np
 import torch
@@ -70,8 +71,11 @@ def set_seed(args):
 def train(args, train_dataset, model, tokenizer):
     """ Train the model """
 
+    #Verify that you are using the same total batch size, where total batch size = batch size on one worker * number of workers.
+    assert(args.total_batch_size == args.per_device_train_batch_size * args.world_size) 
+    
     args.train_batch_size = args.per_device_train_batch_size
-    train_sampler = RandomSampler(train_dataset)
+    train_sampler = DistributedSampler(train_dataset) # use distributed sampler
     train_dataloader = DataLoader(train_dataset, sampler=train_sampler, batch_size=args.train_batch_size)
 
     if args.max_steps > 0:
@@ -110,9 +114,12 @@ def train(args, train_dataset, model, tokenizer):
     model.zero_grad()
     train_iterator = trange(int(args.num_train_epochs), desc="Epoch", disable=args.local_rank not in [-1, 0])
     set_seed(args)  # Added here for reproductibility (even between python 2 and 3)
-    for _ in train_iterator:
+    for epoch in train_iterator:
+        train_sampler.set_epoch(epoch)
         epoch_iterator = tqdm(train_dataloader, desc="Iteration", disable=args.local_rank not in [-1, 0])
         for step, batch in enumerate(epoch_iterator):
+            start_time = time.time()
+            
             model.train()
             batch = tuple(t.to(args.device) for t in batch)
             inputs = {'input_ids':      batch[0],
@@ -133,6 +140,25 @@ def train(args, train_dataset, model, tokenizer):
                 ##################################################
                 # TODO(cos568): perform backward pass here (expect one line of code)
                 loss.backward()
+            
+                for param in model.parameters():
+                    # gather step
+                    if args.local_rank == 0:
+                        gather_list = [torch.zeros_like(param.grad.data) for i in range(args.world_size)]
+                    else:
+                        gather_list = None
+                    torch.distributed.gather(param.grad.data, gather_list, dst = 0)
+                    if args.local_rank == 0:
+                        grad_stack = torch.stack(gather_list)
+                        grad_sum = torch.sum(grad_stack, dim = 0)
+                        grad_avg = grad_sum / float(args.world_size)
+                    
+                    # scatter step
+                    if args.local_rank == 0:
+                        scatter_list = [grad_avg for i in range(args.world_size)]
+                    else:
+                        scatter_list = None
+                    torch.distributed.scatter(param.grad.data, scatter_list, src = 0)
                 ##################################################
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
 
@@ -145,17 +171,22 @@ def train(args, train_dataset, model, tokenizer):
                 scheduler.step() # Update learning rate schedule
                 model.zero_grad()
                 global_step += 1
+            
+            end_time = time.time()
+            time_elapsed = end_time - start_time
+            logger.info(f" step: {step} | process loss: {loss.item()} | time: {time_elapsed}")
 
             if args.max_steps > 0 and global_step > args.max_steps:
                 epoch_iterator.close()
                 break
+
         if args.max_steps > 0 and global_step > args.max_steps:
             train_iterator.close()
             break
         
         ##################################################
         # TODO(cos568): call evaluate() here to get the model performance after every epoch. (expect one line of code)
-        evaluate(args, model, tokenizer)
+        evaluate(args, model, tokenizer, prefix = "")
         ##################################################
 
     return global_step, tr_loss / global_step
@@ -348,12 +379,30 @@ def main():
                              "See details at https://nvidia.github.io/apex/amp.html")
     parser.add_argument("--local_rank", type=int, default=-1,
                         help="For distributed training: local_rank. If single-node training, local_rank defaults to -1.")
+    
+    # Add arguments for distributed training 
+    parser.add_argument("--total_batch_size", type=int, default=64,
+                        help="batch size on one worker * number of workers, should equal 64 for task2-3")
+    parser.add_argument("--master_ip", type=str, default="10.10.1.2",
+                        help="ip address for the master node, usually node-0")
+    parser.add_argument("--master_port", type=str, default="1024",
+                        help="port for the master node, usually node-0")        
+    parser.add_argument("--world_size", type=int, default=4,
+                        help="number of workers, should equal 4 for task2-3")
     args = parser.parse_args()
 
     if os.path.exists(args.output_dir) and os.listdir(args.output_dir) and args.do_train and not args.overwrite_output_dir:
         raise ValueError("Output directory ({}) already exists and is not empty. Use --overwrite_output_dir to overcome.".format(args.output_dir))
 
-    # set up (distributed) training
+   # Init Process Group 
+    torch.distributed.init_process_group(
+            backend='gloo', # for cpu
+            init_method=f"tcp://{args.master_ip}:{args.master_port}",
+            world_size=args.world_size, 
+            rank=args.local_rank, 
+    )
+
+    # set up devices
     args.device = torch.device("cuda" if torch.cuda.is_available() and not args.no_cuda else "cpu")
     args.n_gpu = torch.cuda.device_count()
 
@@ -388,7 +437,7 @@ def main():
     ##################################################
     # TODO(cos568): load the model using from_pretrained. Remember to pass in `config` as an argument.
     # If you pass in args.model_name_or_path (e.g. "bert-base-cased"), the model weights file will be downloaded from HuggingFace. (expect one line of code)
-    
+
     model = model_class.from_pretrained(args.model_name_or_path, config=config)
     
     ##################################################
@@ -400,7 +449,6 @@ def main():
 
     logger.info("Training/evaluation parameters %s", args)
 
-
     # Training
     if args.do_train:
         train_dataset = load_and_cache_examples(args, args.task_name, tokenizer, evaluate=False)
@@ -408,7 +456,8 @@ def main():
         logger.info(" global_step = %s, average loss = %s", global_step, tr_loss)
 
     # Evaluation
-    evaluate(args, model, tokenizer, prefix="")
+    if args.do_eval:
+        evaluate(args, model, tokenizer, prefix="")
 
 if __name__ == "__main__":
     main()

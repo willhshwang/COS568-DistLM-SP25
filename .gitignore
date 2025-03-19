@@ -4,3 +4,6 @@
 glue_data/
 tmp/
 run_adroit.sh
+run_cloud.sh
+run_init.sh
+*.sh
