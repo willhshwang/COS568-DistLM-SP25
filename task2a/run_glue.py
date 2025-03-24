@@ -407,7 +407,7 @@ def main():
     output_train_file = os.path.join(args.output_dir, "train_results.txt") # training
     args.output_train_file = output_train_file
     with open(output_train_file, "w") as writer:
-        writer.write("step,process_loss,time")
+        writer.write("step,process_loss,time\n")
         pass
 
    # Init Process Group 

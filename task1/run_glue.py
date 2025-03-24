@@ -366,7 +366,7 @@ def main():
     output_train_file = os.path.join(args.output_dir, "train_results.txt") # training
     args.output_train_file = output_train_file
     with open(output_train_file, "w") as writer:
-        writer.write("step,process_loss")
+        writer.write("step,process_loss\n")
         pass
 
     # set up (distributed) training

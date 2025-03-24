@@ -5,5 +5,4 @@
 glue_data/
 tmp/
 run_adroit.sh
-*.sh
 outputs/
